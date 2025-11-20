@@ -7,6 +7,7 @@ import glob
 import json
 import os
 import time
+import sys
 from abc import ABC, abstractmethod
 from collections.abc import Generator, Iterable
 from copy import deepcopy
@@ -17,7 +18,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 from torch.distributed import init_device_mesh
-from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
+from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer, AutoModel
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
@@ -250,11 +251,21 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config.update_model_arch(model_config)
             for key, value in diffusers_pretrained_config.__dict__.items():
                 setattr(encoder_config.arch_config, key, value)
+
+            # todo daniel inject runtime hints for wrapper
+            setattr(encoder_config.arch_config, "model_path", model_path)
+            setattr(encoder_config.arch_config, "architectures", ["HFDiffEncoderTextWrapper"])
+            
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[0]
         else:
             assert len(server_args.pipeline_config.text_encoder_configs) == 2
             encoder_config = server_args.pipeline_config.text_encoder_configs[1]
             encoder_config.update_model_arch(model_config)
+            # todo daniel
+            setattr(encoder_config.arch_config, "model_path", model_path)
+            setattr(encoder_config.arch_config, "architectures", ["HFDiffEncoderTextWrapper"])
+
+
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
         target_device = get_local_torch_device()
         # TODO(will): add support for other dtypes

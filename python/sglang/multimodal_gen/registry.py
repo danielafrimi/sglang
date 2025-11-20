@@ -30,6 +30,9 @@ from sglang.multimodal_gen.configs.pipelines.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipelines.nemotron import (
+    NemotronTextPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipelines.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
@@ -42,6 +45,8 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
 )
+
+from sglang.multimodal_gen.configs.sample.nemotron import NemotronTextSamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.stepvideo import StepVideoT2VSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
@@ -241,7 +246,7 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
         if os.path.exists(model_path):
             config = verify_model_config_and_directory(model_path)
         else:
-            config = maybe_download_model_index(model_path)
+            config = maybe_download_model_index(model_path) # config looks like :{'_class_name': 'QwenImagePipeline', '_diffusers_version': '0.34.0.dev0', 'scheduler': ['diffusers', 'FlowMatchEulerDiscreteScheduler'], 'text_encoder': ['transformers', 'Qwen2_5_VLForConditionalGeneration'], 'tokenizer': ['transformers', 'Qwen2Tokenizer'], 'transformer': ['diffusers', 'QwenImageTransformer2DModel'], 'vae': ['diffusers', 'AutoencoderKLQwenImage'], 'pipeline_name': 'QwenImagePipeline'}
     except Exception as e:
         logger.error(f"Could not read model config for '{model_path}': {e}")
         return None
@@ -417,6 +422,16 @@ def _register_configs():
         model_name="qwen-image-edit",
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
+    )
+
+    # Nemotron
+    register_configs(
+        model_name="Nemotron-Diffusion-8B",
+        sampling_param_cls=NemotronTextSamplingParams,
+        pipeline_config_cls=NemotronTextPipelineConfig,
+        model_paths=[
+            "/lustre/fsw/portfolios/coreai/projects/coreai_nvfm_llm/checkpoints/afrimi_ds_r1_ckpt/models/Nemotron-Diffusion-8B",
+        ]
     )
 
 

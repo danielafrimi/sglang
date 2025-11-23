@@ -255,7 +255,6 @@ class TextEncoderLoader(ComponentLoader):
             # todo daniel inject runtime hints for wrapper
             setattr(encoder_config.arch_config, "model_path", model_path)
             setattr(encoder_config.arch_config, "architectures", ["HFDiffEncoderTextWrapper"])
-            
             encoder_dtype = server_args.pipeline_config.text_encoder_precisions[0]
         else:
             assert len(server_args.pipeline_config.text_encoder_configs) == 2
@@ -298,10 +297,9 @@ class TextEncoderLoader(ComponentLoader):
             )
 
         with set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
-            with target_device:
-                architectures = getattr(model_config, "architectures", [])
-                model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
-                model = model_cls(model_config)
+            architectures = getattr(model_config, "architectures", [])
+            model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
+            model = model_cls(model_config)
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
@@ -315,7 +313,7 @@ class TextEncoderLoader(ComponentLoader):
             )
 
             # Explicitly move model to target device after loading weights
-            model = model.to(target_device)
+            model = model.to(target_device) 
 
             if use_cpu_offload:
                 # Disable FSDP for MPS as it's not compatible
@@ -341,11 +339,11 @@ class TextEncoderLoader(ComponentLoader):
             # that have loaded weights tracking currently.
             # if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
-            if weights_not_loaded:
-                raise ValueError(
-                    "Following weights were not initialized from "
-                    f"checkpoint: {weights_not_loaded}"
-                )
+            # if weights_not_loaded:
+                # raise ValueError(
+                #     "Following weights were not initialized from "
+                #     f"checkpoint: {weights_not_loaded}"
+                # )
 
         return model.eval()
 

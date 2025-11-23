@@ -28,6 +28,7 @@ class Qwen3ArchConfig(TextEncoderArchConfig):
     rope_scaling: float | None = None
     attention_bias: bool = False
     head_dim: int | None = None
+    text_len: int = 256 # todo fetch it from config? 
     # Provide common stacked param mapping (qkv, gate/up)
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [

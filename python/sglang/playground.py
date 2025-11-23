@@ -9,13 +9,13 @@ def main():
     generator = DiffGenerator.from_pretrained(
         model_path=model_path_nemotron,
         num_gpus=1, 
-        trust_remote_code=True # Adjust based on your hardware
+        trust_remote_code=True, # Adjust based on your hardware,
+        text_encoder_cpu_offload=False
     )
 
     # Provide a prompt for your video
-    prompt = "a boss  gives his employees candy."
+    prompt = "smart man is walking."
 
-    # Generate the video
     image = generator.generate(
         prompt,
         return_frames=True,  # Also return frames from this call (defaults to False)

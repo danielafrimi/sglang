@@ -29,11 +29,9 @@ class HFDiffEncoderTextWrapper(TextEncoder):
             raise ValueError("model_path not provided in config.arch_config for HFDiffEncoderTextWrapper")
         trust_remote_code: bool = bool(getattr(self.config.arch_config, "trust_remote_code", True))
         dtype: Optional[torch.dtype] = getattr(self.config.arch_config, "compute_dtype", None)
-        device: Optional[torch.device | str] = getattr(self.config.arch_config, "device", None)
 
-        hf_model = AutoModel.from_pretrained(model_path, trust_remote_code=trust_remote_code)
-        if device is not None:
-            hf_model = hf_model.to(device=device)
+        hf_model = AutoModel.from_pretrained(model_path, trust_remote_code=trust_remote_code, )
+        # hf_model = hf_model.to(device=device) # todo we need to pass the model into the same device, and this is not as
         if dtype is not None:
             try:
                 hf_model = hf_model.to(dtype=dtype)
@@ -51,41 +49,19 @@ class HFDiffEncoderTextWrapper(TextEncoder):
         output_hidden_states: bool | None = None,
         **kwargs: Any,
     ) -> BaseEncoderOutput:
-        # Prefer direct encoder call if available (DiffEncoderModel exposes .encoder)
-        if hasattr(self.hf_model, "encoder"):
-            encoder = getattr(self.hf_model, "encoder")
-            enc_out = encoder(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                **kwargs,
-            )
-            last_hidden_state = enc_out.last_hidden_state
-            return BaseEncoderOutput(
-                last_hidden_state=last_hidden_state,
-                hidden_states=(last_hidden_state,) if output_hidden_states else None,
-            )
 
-        # Fallback: rely on HF outputs.hidden_states
-        outputs = self.hf_model(
+        # Pass output_hidden_states to the HF model/encoder if requested or implied
+        # We force it True here because we typically need hidden states for downstream tasks.
+        return self.hf_model.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            output_hidden_states=True,
+            output_hidden_states=True, # This is important to return
             **kwargs,
         )
-        if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
-            last_hidden_state = outputs.hidden_states[-1]
-        elif hasattr(outputs, "last_hidden_state"):
-            last_hidden_state = outputs.last_hidden_state
-        else:
-            raise RuntimeError("HF model did not return hidden states or last_hidden_state.")
 
-        return BaseEncoderOutput(
-            last_hidden_state=last_hidden_state,
-            hidden_states=outputs.hidden_states if hasattr(outputs, "hidden_states") else (last_hidden_state,),
-        )
+       
+
 
     @torch.no_grad()
     def load_weights(self, *args, **kwargs):

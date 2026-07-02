@@ -10,14 +10,14 @@ import math
 import os
 import time
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from functools import lru_cache
 from typing import Any
 
 import torch
 import torch.nn as nn
-from tqdm.auto import tqdm
 
 from sglang.jit_kernel.nvfp4 import prewarm_nvfp4_jit_modules
 from sglang.multimodal_gen import envs
@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_group,
     get_world_group,
     get_world_size,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
     run_cfg_parallel,
@@ -58,6 +59,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
+    world_group_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
@@ -70,6 +72,10 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+    is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -100,11 +106,24 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_enabled as precision_autocast_enabled,
+)
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_precision,
+)
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, dict_to_3d_list
+from sglang.multimodal_gen.utils import dict_to_3d_list
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
+
+
+def _ensure_tensor_model_output(model_output):
+    sample = getattr(model_output, "sample", None)
+    if isinstance(sample, torch.Tensor):
+        return sample
+    return model_output
 
 
 @dataclass(slots=True)
@@ -187,14 +206,20 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         attn_head_size = hidden_size // num_attention_heads
 
         # torch compile
+        # list of offloaded dit modules if torch compile is enabled. cleared after compile and warmup
+        self._offloaded_dit_modules_for_compile: list[torch.nn.Module] = []
+        # layerwise-offload and then compile to avoid OOM
         for transformer in filter(None, [self.transformer, self.transformer_2]):
-            self._maybe_enable_torch_compile(transformer)
+            self._maybe_offload_during_compile(transformer)
+            self._maybe_torch_compile(transformer)
 
         self.scheduler = scheduler
         self.vae = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
         selected_attention_backend = self._infer_transformer_attention_backend()
+        # precision-constraint: attention backend metadata allocation currently assumes fp16;
+        # do not replace with user precision policy without auditing backend support.
         self.attn_backend = get_attn_backend(
             head_size=attn_head_size,
             dtype=torch.float16,
@@ -243,7 +268,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         stage_name = self._component_stage_name(stage_name)
         uses: list[ComponentUse] = []
         if self.vae is not None:
-            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            vae_dtype = resolve_precision(
+                server_args, "vae", precision_attr="vae_precision"
+            )
             uses.append(
                 ComponentUse(
                     stage_name=stage_name,
@@ -280,7 +307,49 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 return name
         return default_name
 
-    def _maybe_enable_torch_compile(self, module: object) -> None:
+    def _maybe_offload_during_compile(self, module: object) -> None:
+        """
+        Layerwise-offload the DiT so the compile warmup autotunes each layer
+        with only itself resident; forward() restores it after the warmup.
+        """
+        args = self.server_args
+        if (
+            not args.enable_torch_compile
+            or not args.offload_during_compile
+            or not args.warmup
+            # a subclass with its own forward would never run the restore
+            or type(self).forward is not DenoisingStage.forward
+            or args.use_fsdp_inference
+            or envs.SGLANG_CACHE_DIT_ENABLED
+            or not isinstance(module, LayerwiseOffloadableModuleMixin)
+            or is_layerwise_offloaded_module(module)
+        ):
+            return
+        module.configure_layerwise_offload(args)
+        if is_layerwise_offloaded_module(module):
+            self._offloaded_dit_modules_for_compile.append(module)
+
+    def _move_resident_components_for_warmup(self) -> list[torch.nn.Module]:
+        """Move resident non-DiT components off-device while the warmup
+        denoising (the compile/autotune peak) runs; forward() moves them back."""
+        pipeline = self.pipeline() if self.pipeline is not None else None
+        if pipeline is None:
+            return []
+        dit_ids = {id(self.transformer), id(self.transformer_2)}
+        moved = []
+        for module in pipeline.modules.values():
+            if (
+                isinstance(module, torch.nn.Module)
+                and id(module) not in dit_ids
+                and not is_layerwise_offloaded_module(module)
+            ):
+                param = next(module.parameters(), None)
+                if param is not None and param.device.type != "cpu":
+                    module.to("cpu")
+                    moved.append(module)
+        return moved
+
+    def _maybe_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
@@ -310,8 +379,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 _inductor_cfg.reorder_for_compute_comm_overlap = True
             except ImportError:
                 pass
-            mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+            dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
+            mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
+                dit_config,
+                "torch_compile_mode",
+                "max-autotune-no-cudagraphs",
             )
             compile_kwargs["mode"] = mode
             logger.info(f"Compiling transformer with mode: {mode}")
@@ -333,7 +405,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """Apply request-dependent transformer acceleration in trace-safe order."""
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
-            self._maybe_enable_torch_compile(transformer)
+            self._maybe_torch_compile(transformer)
 
     @staticmethod
     def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
@@ -524,6 +596,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 model_name="transformer",
                 sp_group=sp_group,
                 tp_group=tp_group,
+                has_separate_cfg=batch.do_classifier_free_guidance,
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
@@ -610,7 +683,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         scheduler = batch.scheduler
         assert scheduler is not None
 
-        boundary_timestep = self._handle_boundary_ratio(server_args, batch, scheduler)
+        boundary_timestep = (
+            self._handle_boundary_ratio(server_args, batch, scheduler)
+            if self.transformer_2 is not None
+            else None
+        )
         # Get timesteps and calculate warmup steps
         timesteps = batch.timesteps
         num_inference_steps = batch.num_inference_steps
@@ -651,10 +728,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         # Setup precision and autocast settings
-        target_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
-        autocast_enabled = (
-            target_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        target_dtype = resolve_precision(
+            server_args, "dit", precision_attr="dit_precision"
+        )
+        autocast_enabled = precision_autocast_enabled(
+            target_dtype, server_args.disable_autocast
+        )
 
         # Prepare image latents and embeddings for I2V generation
         image_embeds = batch.image_embeds
@@ -678,7 +757,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # TI2V specific preparations - before SP sharding
         if should_preprocess_for_wan_ti2v:
-            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            vae_dtype = resolve_precision(
+                server_args, "vae", precision_attr="vae_precision"
+            )
             with self.use_declared_component(
                 component_name="vae",
                 module=self.vae,
@@ -853,7 +934,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             "invalidations": 0,
         }
 
-        if ctx.is_warmup or get_world_group().local_rank != 0:
+        if not (active or requested):
+            return
+
+        if ctx.is_warmup or (
+            world_group_is_initialized() and get_world_group().local_rank != 0
+        ):
             return
 
         if active:
@@ -1075,7 +1161,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             not state
             or not state["requested"]
             or ctx.is_warmup
-            or get_world_group().local_rank != 0
+            or (world_group_is_initialized() and get_world_group().local_rank != 0)
         ):
             return
 
@@ -1118,7 +1204,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # Gather noise_pred if using sequence parallelism
         # noise_pred has the same shape as latents (sharded along sequence dimension)
         if (
-            get_sp_world_size() > 1
+            self._sp_world_size() > 1
             and getattr(batch, "did_sp_shard_latents", False)
             and server_args.comfyui_mode
             and hasattr(batch, "noise_pred")
@@ -1167,7 +1253,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
-        if get_sp_world_size() <= 1:
+        if self._sp_world_size() <= 1:
             return
 
         if batch.latents is not None:
@@ -1205,7 +1291,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         trajectory_tensor: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Gather latents after Sequence Parallelism if they were sharded."""
-        if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
+        if self._sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
             latents = self.server_args.pipeline_config.gather_latents_for_sp(
                 latents, batch=batch
             )
@@ -1230,6 +1316,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         if trajectory_tensor.shape[2] > orig_s:
                             trajectory_tensor = trajectory_tensor[:, :, :orig_s, :]
         return latents, trajectory_tensor
+
+    def _sp_world_size(self) -> int:
+        if not model_parallel_is_initialized():
+            return 1
+        return get_sp_world_size()
 
     def step_profile(self):
         profiler = SGLDiffusionProfiler.get_instance()
@@ -1307,6 +1398,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 target_dtype,
                 seq_len,
                 reserved_frames_mask,
+                server_args.pipeline_config.dit_config.arch_config.patch_size,
             )
         else:
             timestep = t_device.repeat(bsz)
@@ -1322,8 +1414,45 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         return latents
 
-    @torch.no_grad()
+    @contextmanager
+    def _offload_for_torch_compile_warmup(self, batch: Req):
+        """wrap a denoise so the torch.compile warmup has spare VRAM.
+
+        No-op unless the DiT was layerwise-offloaded for compile.
+        Warmup: move resident non-DiT components off-device for the autotune window, restore
+        after.
+        """
+        if not self._offloaded_dit_modules_for_compile:
+            yield
+            return
+        # if the dits have been layerwise-offloaded in preparation stage
+        if batch.is_warmup:
+            # if warmup is enabled, for warmup request, offload components to ensure sufficient VRAM headroom for torch compile
+            moved = self._move_resident_components_for_warmup()
+            try:
+                yield
+            finally:
+                device = get_local_torch_device()
+                for module in moved:
+                    module.to(device)
+            return
+        # prepare for first real request: restore the user-configured residency
+        for module in self._offloaded_dit_modules_for_compile:
+            module.disable_offload()
+        # clear the list for avoid overhead during real request
+        self._offloaded_dit_modules_for_compile.clear()
+        yield
+
     def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        with self._offload_for_torch_compile_warmup(batch):
+            return self._denoise(batch, server_args)
+
+    @torch.no_grad()
+    def _denoise(
         self,
         batch: Req,
         server_args: ServerArgs,
@@ -1359,7 +1488,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             ),
             maybe_nvtx_range("denoising_loop", use_nvtx),
         ):
-            with self.progress_bar(total=ctx.num_inference_steps) as progress_bar:
+            with self.progress_bar(
+                total=ctx.num_inference_steps, batch=batch
+            ) as progress_bar:
                 for step_index, t_host in enumerate(timesteps_cpu):
                     # Use ``:.4g`` so flow-matching schedulers (e.g. FLUX) that
                     # use non-integer timesteps keep their precision in markers.
@@ -1476,16 +1607,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if accepts_var_kwargs:
             return kwargs
         return {k: v for k, v in kwargs.items() if k in param_names}
-
-    def progress_bar(
-        self, iterable: Iterable | None = None, total: int | None = None
-    ) -> tqdm:
-        """
-        Create a progress bar for the denoising process.
-        """
-        local_rank = get_world_group().local_rank
-        disable = local_rank != 0
-        return tqdm(iterable=iterable, total=total, disable=disable)
 
     def _predict_noise_with_cfg(
         self,
@@ -1785,12 +1906,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             getattr(current_model, "forward", current_model),
             {"guidance": guidance},
         )
-        return current_model(
+        model_output = current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
             **guidance_kwargs,
             **kwargs,
         )
+        return _ensure_tensor_model_output(model_output)
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
         """

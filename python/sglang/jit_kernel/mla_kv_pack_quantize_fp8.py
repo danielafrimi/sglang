@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.fp8_triton_dtype import fp8_dtype_to_triton
 from sglang.jit_kernel.utils import is_arch_support_pdl
 
 
@@ -60,19 +61,24 @@ def _v0_kernel(
     k_nope_fp8 = (k_nope.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
     k_pe_fp8 = (k_pe.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
     v_fp8 = (v.to(tl.float32) * v_scale_inv).to(FP8_DTYPE)
+    k_nope_fp8_bytes = k_nope_fp8.to(tl.uint8, bitcast=True)
+    k_pe_fp8_bytes = k_pe_fp8.to(tl.uint8, bitcast=True)
+    v_fp8_bytes = v_fp8.to(tl.uint8, bitcast=True)
     k_out_base = t_idx[:, None] * k_out_stride_t + pid_h * k_out_stride_h
     tl.store(
-        k_out_ptr + k_out_base + nope_idx[None, :], k_nope_fp8, mask=t_mask[:, None]
+        k_out_ptr + k_out_base + nope_idx[None, :],
+        k_nope_fp8_bytes,
+        mask=t_mask[:, None],
     )
     tl.store(
         k_out_ptr + k_out_base + QK_NOPE + rope_idx[None, :],
-        k_pe_fp8,
+        k_pe_fp8_bytes,
         mask=t_mask[:, None],
     )
     v_out_off = (
         t_idx[:, None] * v_out_stride_t + pid_h * v_out_stride_h + v_idx[None, :]
     )
-    tl.store(v_out_ptr + v_out_off, v_fp8, mask=t_mask[:, None])
+    tl.store(v_out_ptr + v_out_off, v_fp8_bytes, mask=t_mask[:, None])
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -128,11 +134,18 @@ def _v1_flat_kernel(
     k_nope_fp8 = (k_nope.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
     k_pe_fp8 = (k_pe.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
     v_fp8 = (v.to(tl.float32) * v_scale_inv).to(FP8_DTYPE)
+    k_nope_fp8_bytes = k_nope_fp8.to(tl.uint8, bitcast=True)
+    k_pe_fp8_bytes = k_pe_fp8.to(tl.uint8, bitcast=True)
+    v_fp8_bytes = v_fp8.to(tl.uint8, bitcast=True)
     k_out_base = t_idx[:, None] * k_out_stride_t + h_idx[:, None] * k_out_stride_h
-    tl.store(k_out_ptr + k_out_base + nope_idx[None, :], k_nope_fp8, mask=mask[:, None])
+    tl.store(
+        k_out_ptr + k_out_base + nope_idx[None, :],
+        k_nope_fp8_bytes,
+        mask=mask[:, None],
+    )
     tl.store(
         k_out_ptr + k_out_base + QK_NOPE + rope_idx[None, :],
-        k_pe_fp8,
+        k_pe_fp8_bytes,
         mask=mask[:, None],
     )
     v_out_off = (
@@ -140,7 +153,7 @@ def _v1_flat_kernel(
         + h_idx[:, None] * v_out_stride_h
         + v_idx_[None, :]
     )
-    tl.store(v_out_ptr + v_out_off, v_fp8, mask=mask[:, None])
+    tl.store(v_out_ptr + v_out_off, v_fp8_bytes, mask=mask[:, None])
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -160,12 +173,6 @@ def _pick_kernel(s: int, num_heads: int) -> Tuple[str, dict]:
     if s <= 1536:
         return "v0", {"BLOCK_S": 16, "num_warps": 4, "num_stages": 3}
     return "v1_flat", {"BLOCK": 16, "num_warps": 8, "num_stages": 3}
-
-
-_FP8_DTYPE_MAP = {
-    torch.float8_e4m3fn: tl.float8e4nv,
-    torch.float8_e5m2: tl.float8e5,
-}
 
 
 def mla_kv_pack_quantize_fp8(
@@ -220,11 +227,13 @@ def mla_kv_pack_quantize_fp8(
         )
     if v_out is None:
         v_out = torch.empty((s, num_heads, v_head), dtype=fp8_dtype, device=v.device)
+    k_out_bytes = k_out.view(torch.uint8)
+    v_out_bytes = v_out.view(torch.uint8)
 
     if enable_pdl is None:
         enable_pdl = is_arch_support_pdl()
 
-    fp8_tl_dtype = _FP8_DTYPE_MAP[fp8_dtype]
+    fp8_tl_dtype = fp8_dtype_to_triton(fp8_dtype)
     kernel_choice, cfg = _pick_kernel(s, num_heads)
     extra = {"launch_pdl": True} if enable_pdl else {}
 
@@ -235,8 +244,8 @@ def mla_kv_pack_quantize_fp8(
             k_nope,
             k_pe_2d,
             v,
-            k_out,
-            v_out,
+            k_out_bytes,
+            v_out_bytes,
             float(k_scale_inv),
             float(v_scale_inv),
             s,
@@ -245,10 +254,10 @@ def mla_kv_pack_quantize_fp8(
             k_pe_2d.stride(0),
             v.stride(0),
             v.stride(1),
-            k_out.stride(0),
-            k_out.stride(1),
-            v_out.stride(0),
-            v_out.stride(1),
+            k_out_bytes.stride(0),
+            k_out_bytes.stride(1),
+            v_out_bytes.stride(0),
+            v_out_bytes.stride(1),
             QK_NOPE=qk_nope,
             QK_ROPE=qk_rope,
             V_HEAD=v_head,
@@ -267,8 +276,8 @@ def mla_kv_pack_quantize_fp8(
             k_nope,
             k_pe_2d,
             v,
-            k_out,
-            v_out,
+            k_out_bytes,
+            v_out_bytes,
             float(k_scale_inv),
             float(v_scale_inv),
             s,
@@ -278,10 +287,10 @@ def mla_kv_pack_quantize_fp8(
             k_pe_2d.stride(0),
             v.stride(0),
             v.stride(1),
-            k_out.stride(0),
-            k_out.stride(1),
-            v_out.stride(0),
-            v_out.stride(1),
+            k_out_bytes.stride(0),
+            k_out_bytes.stride(1),
+            v_out_bytes.stride(0),
+            v_out_bytes.stride(1),
             QK_NOPE=qk_nope,
             QK_ROPE=qk_rope,
             V_HEAD=v_head,

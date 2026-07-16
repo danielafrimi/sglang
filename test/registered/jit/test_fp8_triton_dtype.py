@@ -28,3 +28,7 @@ def test_fp8_dtype_to_triton_uses_arch_specific_e4m3_name():
         fp8_dtype_to_triton(torch.float8_e5m2, cuda_capability=(8, 0))
         == tl.float8e5
     )
+
+
+def test_fp8_dtype_to_triton_maps_e4m3fnuz():
+    assert fp8_dtype_to_triton(torch.float8_e4m3fnuz) == tl.float8e4b8

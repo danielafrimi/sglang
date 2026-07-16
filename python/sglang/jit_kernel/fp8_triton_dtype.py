@@ -39,6 +39,8 @@ def fp8_dtype_to_triton(
         if use_fp8_e4b15_for_e4m3fn(device, cuda_capability):
             return tl.float8e4b15
         return tl.float8e4nv
+    if fp8_dtype == torch.float8_e4m3fnuz:
+        return tl.float8e4b8
     if fp8_dtype == torch.float8_e5m2:
         return tl.float8e5
     raise ValueError(f"Unsupported FP8 dtype: {fp8_dtype}")

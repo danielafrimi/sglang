@@ -19,6 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.fp8_triton_dtype import fp8_dtype_to_triton
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,6 +45,7 @@ def _process_kv_tensor(
     cache_stride_dim: tl.constexpr,
     BLOCK_HEAD: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
 ):
     """Process a block of heads for a single K or V tensor."""
     head_idx = head_block_id * BLOCK_HEAD
@@ -69,9 +72,9 @@ def _process_kv_tensor(
 
         # Quantize to FP8
         if use_provided_scale:
-            block_fp8 = (block * inv_scale).to(tl.float8e4nv)
+            block_fp8 = (block * inv_scale).to(FP8_DTYPE)
         else:
-            block_fp8 = block.to(tl.float8e4nv)
+            block_fp8 = block.to(FP8_DTYPE)
 
         # Write to cache at [page_id, page_offset, head, dim]
         cache_offsets = (
@@ -81,7 +84,11 @@ def _process_kv_tensor(
             + dim_offsets[None, :] * cache_stride_dim
         )
 
-        tl.store(cache_ptr + cache_offsets, block_fp8, mask=mask)
+        tl.store(
+            cache_ptr + cache_offsets,
+            block_fp8.to(tl.uint8, bitcast=True),
+            mask=mask,
+        )
 
 
 @triton.jit
@@ -120,6 +127,7 @@ def _fused_fp8_set_kv_buffer_kernel(
     v_cache_stride_offset: tl.constexpr,
     v_cache_stride_head: tl.constexpr,
     v_cache_stride_dim: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
     # Block sizes
     BLOCK_HEAD: tl.constexpr,  # Number of heads per block
     BLOCK_DIM: tl.constexpr,  # Head dimension block size
@@ -171,6 +179,7 @@ def _fused_fp8_set_kv_buffer_kernel(
             k_cache_stride_dim,
             BLOCK_HEAD,
             BLOCK_DIM,
+            FP8_DTYPE,
         )
     else:
         # Process V tensor
@@ -198,6 +207,7 @@ def _fused_fp8_set_kv_buffer_kernel(
             v_cache_stride_dim,
             BLOCK_HEAD,
             BLOCK_DIM,
+            FP8_DTYPE,
         )
 
 
@@ -380,12 +390,17 @@ def fused_fp8_set_kv_buffer(
             inv_k_scale_ptr = k_3d
             inv_v_scale_ptr = k_3d
 
+        def _as_byte_cache(cache: torch.Tensor) -> torch.Tensor:
+            if cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                return cache.view(torch.uint8)
+            return cache
+
         # Launch Triton kernel
         _fused_fp8_set_kv_buffer_kernel[grid](
             k_3d,
             v_3d,
-            k_cache,
-            v_cache,
+            _as_byte_cache(k_cache),
+            _as_byte_cache(v_cache),
             cache_loc,
             inv_k_scale_ptr,
             inv_v_scale_ptr,
@@ -407,6 +422,7 @@ def fused_fp8_set_kv_buffer(
             v_cache_stride_offset,
             v_cache_stride_head,
             v_cache_stride_dim,
+            FP8_DTYPE=fp8_dtype_to_triton(torch.float8_e4m3fn),
             BLOCK_HEAD=BLOCK_HEAD,
             BLOCK_DIM=BLOCK_DIM,
         )

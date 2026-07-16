@@ -38,6 +38,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_linear_bmm_flashinfer,
+    can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     is_blackwell_supported,
 )
@@ -46,6 +47,9 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     prepare_moe_nvfp4_layer_for_marlin,
     prepare_nvfp4_layer_for_marlin,
+)
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
@@ -58,6 +62,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.utils.common import (
+    get_bool_env_var,
     get_device_capability,
     is_cuda,
     is_flashinfer_available,
@@ -500,6 +505,10 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.enable_flashinfer_bmm = is_sm100_supported() and is_flashinfer_available()
+        self.use_marlin = False
+        if is_cuda():
+            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            self.use_marlin = force_marlin or can_auto_enable_marlin_fp8()
 
     def create_weights(
         self,
@@ -524,6 +533,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
 
         # Register weight
         layer.register_parameter(
@@ -561,6 +571,10 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
+        if self.use_marlin:
+            prepare_fp8_layer_for_marlin(layer)
+            # Marlin uses FP8 weights with unquantized activations.
+            del layer.input_scale
 
     def apply(
         self,
@@ -569,6 +583,16 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
+        if self.use_marlin:
+            return torch.ops.sglang.apply_fp8_marlin_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                workspace=layer.workspace,
+                size_n=layer.output_size_per_partition,
+                size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
         if self.enable_flashinfer_bmm and layer.input_scale is not None:
             return apply_fp8_linear_bmm_flashinfer(
                 input=x,

@@ -15,6 +15,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.fp8_triton_dtype import fp8_dtype_to_triton
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 _fp8_fnuz = is_fp8_fnuz()
@@ -96,7 +97,7 @@ def _fused_qk_norm_rope_store_kernel(
     BYTES_PER_TOKEN: tl.constexpr,
     SWA_PAGE_SIZE: tl.constexpr,
     BF16_STORE: tl.constexpr,
-    IS_FNUZ: tl.constexpr,
+    FP8_DTYPE: tl.constexpr,
 ):
     pid_m = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1).to(tl.int64)
@@ -260,14 +261,9 @@ def _fused_qk_norm_rope_store_kernel(
             x_scaled = tile_data * inv_scale[:, None]
             x_fp8 = tl.clamp(x_scaled, FP8_MIN, FP8_MAX)
 
-            # Encode with the SAME fp8 type the decode bitcasts (read
-            # _KV_FP8_TY = float8e4b8 for e4m3fnuz / float8e4nv otherwise).
-            # An implicit/fn cast mis-encodes under fnuz (exponent bias 7 vs
-            # fnuz bias 8), so the fnuz read decodes every element 2x too small.
-            if IS_FNUZ:
-                x_fp8_cast = x_fp8.to(tl.float8e4b8)
-            else:
-                x_fp8_cast = x_fp8.to(tl.float8e4nv)
+            # Encode with the same fp8 family the decode bitcasts. On CUDA
+            # SM80 Triton names e4m3fn as float8e4b15, not float8e4nv.
+            x_fp8_cast = x_fp8.to(FP8_DTYPE)
             x_fp8_bytes = x_fp8_cast.to(tl.uint8, bitcast=True)
             fp8_byte_offs = value_base[:, None] + tile_start + nope_tile_offs[None, :]
             tl.store(
@@ -356,10 +352,8 @@ def fused_qk_norm_rope_swa_store(
     scale_pad = 1
     bytes_per_token = dim_nope + dim_rope * 2 + num_nope_tiles + scale_pad
 
-    if _fp8_fnuz:
-        fp8_info = torch.finfo(torch.float8_e4m3fnuz)
-    else:
-        fp8_info = torch.finfo(torch.float8_e4m3fn)
+    fp8_torch_dtype = torch.float8_e4m3fnuz if _fp8_fnuz else torch.float8_e4m3fn
+    fp8_info = torch.finfo(fp8_torch_dtype)
 
     BLOCK_SIZE_M = min(4, triton.next_power_of_2(M)) if M < 4 else 4
     num_warps = 4
@@ -404,7 +398,7 @@ def fused_qk_norm_rope_swa_store(
         BYTES_PER_TOKEN=bytes_per_token,
         SWA_PAGE_SIZE=swa_page_size,
         BF16_STORE=bf16_store,
-        IS_FNUZ=_fp8_fnuz,
+        FP8_DTYPE=fp8_dtype_to_triton(fp8_torch_dtype),
         num_warps=num_warps,
     )
     return q_out
